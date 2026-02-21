@@ -32,6 +32,7 @@ class Searcher {
         this._embeddingFn = null;
         this._initialized = false;
         this.model = config.embedding?.model || 'Xenova/all-MiniLM-L6-v2';
+        this._embeddingConfig = config.embedding || {};
 
         // Temporal ranking config
         this._recencyHalfLifeDays = config.search?.recencyHalfLifeDays || 14;
@@ -50,33 +51,130 @@ class Searcher {
      * If the Indexer has already been initialized, this shares its DB.
      * Otherwise, creates its own embedding pipeline.
      */
+    /**
+     * Initialize embedding function for query generation.
+     * Priority: llama.cpp server → @chroma-core/default-embed → @huggingface/transformers
+     *
+     * For llama.cpp, uses "search_query: " prefix for nomic-style models
+     * (vs "search_document: " used by the indexer).
+     */
     async initialize() {
         if (this._initialized) return;
 
+        const ec = this._embeddingConfig;
+
+        // 1) Try llama.cpp embedding server
+        const llamaUrl = ec.llamaUrl || process.env.LLAMA_EMBED_URL || 'http://localhost:8082';
+        try {
+            const http = require('http');
+            const usePrefix = this._shouldPrefixTasks(this.model);
+            const testInput = usePrefix ? 'search_query: test' : 'test';
+            const testPayload = JSON.stringify({ input: testInput, model: this.model });
+
+            const result = await new Promise((resolve, reject) => {
+                const url = new URL(`${llamaUrl}/v1/embeddings`);
+                const req = http.request({
+                    hostname: url.hostname,
+                    port: url.port,
+                    path: url.pathname,
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(testPayload) },
+                    timeout: 5000,
+                }, (res) => {
+                    let body = '';
+                    res.on('data', chunk => body += chunk);
+                    res.on('end', () => {
+                        try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+                    });
+                });
+                req.on('error', reject);
+                req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                req.write(testPayload);
+                req.end();
+            });
+
+            if (result?.data?.[0]?.embedding?.length > 0) {
+                const modelName = this.model;
+                this._embeddingFn = {
+                    generate: async (texts) => {
+                        const prefixed = usePrefix
+                            ? texts.map(t => t.startsWith('search_') ? t : `search_query: ${t}`)
+                            : texts;
+                        const payload = JSON.stringify({ input: prefixed, model: modelName });
+                        return new Promise((resolve, reject) => {
+                            const url = new URL(`${llamaUrl}/v1/embeddings`);
+                            const req = http.request({
+                                hostname: url.hostname,
+                                port: url.port,
+                                path: url.pathname,
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+                                timeout: 30000,
+                            }, (res) => {
+                                let body = '';
+                                res.on('data', chunk => body += chunk);
+                                res.on('end', () => {
+                                    try {
+                                        const data = JSON.parse(body);
+                                        resolve((data.data || []).map(d => d.embedding));
+                                    } catch (e) { reject(e); }
+                                });
+                            });
+                            req.on('error', reject);
+                            req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+                            req.write(payload);
+                            req.end();
+                        });
+                    }
+                };
+                this._initialized = true;
+                console.log(`[Searcher] llama.cpp embedding server ready (${llamaUrl})`);
+                return;
+            }
+        } catch (err) {
+            console.warn(`[Searcher] llama.cpp not available: ${err.message}`);
+        }
+
+        // 2) Fallback: @chroma-core/default-embed
         try {
             const { DefaultEmbeddingFunction } = require('@chroma-core/default-embed');
             this._embeddingFn = new DefaultEmbeddingFunction();
             await this._embeddingFn.generate(['warmup']);
             this._initialized = true;
+            return;
         } catch {
-            try {
-                const { pipeline } = require('@huggingface/transformers');
-                const pipe = await pipeline('feature-extraction', this.model);
-                this._embeddingFn = {
-                    generate: async (texts) => {
-                        const results = [];
-                        for (const text of texts) {
-                            const output = await pipe(text, { pooling: 'mean', normalize: true });
-                            results.push(Array.from(output.data));
-                        }
-                        return results;
-                    }
-                };
-                this._initialized = true;
-            } catch (err) {
-                console.error('[Searcher] No embedding model available:', err.message);
-            }
+            // fall through
         }
+
+        // 3) Fallback: @huggingface/transformers
+        try {
+            const { pipeline } = require('@huggingface/transformers');
+            const pipe = await pipeline('feature-extraction', this.model);
+            this._embeddingFn = {
+                generate: async (texts) => {
+                    const results = [];
+                    for (const text of texts) {
+                        const output = await pipe(text, { pooling: 'mean', normalize: true });
+                        results.push(Array.from(output.data));
+                    }
+                    return results;
+                }
+            };
+            this._initialized = true;
+        } catch (err) {
+            console.error('[Searcher] No embedding model available:', err.message);
+        }
+    }
+
+    /**
+     * Check if the model needs task-type prefixes (nomic-embed style).
+     * @param {string} model
+     * @returns {boolean}
+     */
+    _shouldPrefixTasks(model) {
+        if (!model) return false;
+        const lower = model.toLowerCase();
+        return lower.includes('nomic');
     }
 
     /**
