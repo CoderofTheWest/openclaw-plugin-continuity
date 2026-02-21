@@ -1,5 +1,5 @@
 {
-  "id": "openclaw-plugin-continuity",
+  "id": "continuity",
   "name": "Infinite Thread — Agent Continuity & Memory",
   "description": "Persistent, intelligent memory for OpenClaw agents. Context budgeting, continuity anchors, topic tracking, conversation archiving, and cross-session semantic search via SQLite-vec. Gives an agent the ability to remember, not just retrieve.",
   "version": "0.1.0",

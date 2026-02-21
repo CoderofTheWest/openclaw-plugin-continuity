@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-plugin-continuity",
+  "name": "continuity",
   "version": "0.1.0",
   "description": "Infinite Thread — persistent, intelligent memory for OpenClaw agents. Context budgeting, continuity anchors, topic tracking, conversation archiving, and cross-session semantic search via SQLite-vec.",
   "main": "index.js",
