@@ -439,20 +439,36 @@ class Searcher {
 
     _truncate(text, maxLen) {
         if (!text || text.length <= maxLen) return text;
-        // Sentence-boundary aware: find last sentence end before maxLen
-        const region = text.substring(0, maxLen);
-        const lastSentenceEnd = Math.max(
-            region.lastIndexOf('. '),
-            region.lastIndexOf('? '),
-            region.lastIndexOf('! '),
-            region.lastIndexOf('.\n'),
-            region.lastIndexOf('?\n'),
-            region.lastIndexOf('!\n')
-        );
-        if (lastSentenceEnd > maxLen * 0.5) {
-            return text.substring(0, lastSentenceEnd + 1) + '...';
+
+        const chunk = text.substring(0, maxLen);
+
+        // 1) Sentence-boundary aware: find last sentence-ending punctuation
+        //    followed by whitespace or newline + capital letter (new sentence)
+        const sentenceEnd = chunk.search(/[.!?]\s+[A-Z][^.!?]*$/);
+        if (sentenceEnd > maxLen * 0.4) {
+            return chunk.substring(0, sentenceEnd + 1) + ' …';
         }
-        return text.substring(0, maxLen - 3) + '...';
+
+        // 2) Fallback: find last sentence-end punctuation followed by space/newline
+        const lastPunct = Math.max(
+            chunk.lastIndexOf('. '),
+            chunk.lastIndexOf('? '),
+            chunk.lastIndexOf('! '),
+            chunk.lastIndexOf('.\n'),
+            chunk.lastIndexOf('?\n'),
+            chunk.lastIndexOf('!\n')
+        );
+        if (lastPunct > maxLen * 0.5) {
+            return text.substring(0, lastPunct + 1) + ' …';
+        }
+
+        // 3) Fallback: cut at last space to avoid mid-word breaks
+        const lastSpace = chunk.lastIndexOf(' ');
+        if (lastSpace > maxLen * 0.6) {
+            return chunk.substring(0, lastSpace) + ' …';
+        }
+
+        return chunk.substring(0, maxLen - 3) + '...';
     }
 }
 
