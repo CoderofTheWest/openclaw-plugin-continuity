@@ -20,8 +20,9 @@ class Indexer {
     /**
      * @param {object} config - full plugin config (reads embedding section)
      * @param {string} dataDir - plugin data directory
+     * @param {object} [embeddingProvider] - shared EmbeddingProvider instance (from embedding.js)
      */
-    constructor(config = {}, dataDir) {
+    constructor(config = {}, dataDir, embeddingProvider = null) {
         const ec = config.embedding || {};
         this.dbPath = path.join(dataDir, ec.dbFile || 'continuity.db');
         this.dimensions = ec.dimensions || 384;
@@ -29,8 +30,8 @@ class Indexer {
         this.indexLogPath = path.join(dataDir, 'index-log.json');
 
         this.db = null;
-        this._embeddingFn = null;
-        this._embeddingPipeline = null;
+        this._embeddingFn = embeddingProvider; // shared provider (preferred)
+        this._embeddingPipeline = null;        // legacy fallback only
         this._initialized = false;
         this._fts5Available = false;
     }
@@ -62,8 +63,10 @@ class Indexer {
             // Create tables
             this._createTables();
 
-            // Initialize embeddings
-            await this._initEmbeddings();
+            // Initialize embeddings (skip if shared provider was injected)
+            if (!this._embeddingFn) {
+                await this._initEmbeddings();
+            }
 
             this._initialized = true;
             console.log('[Indexer] Initialized — SQLite-vec ready');
@@ -301,18 +304,22 @@ class Indexer {
                     `INSERT INTO fts_exchanges (id, user_text, agent_text) VALUES (?, ?, ?)`
                 );
 
-                const allExchanges = this.db.prepare(
+                // Use iterate() instead of all() to avoid loading all exchanges
+                // into memory at once (fixes memory spike with 13K+ exchanges)
+                const iter = this.db.prepare(
                     'SELECT id, user_text, agent_text FROM exchanges'
-                ).all();
+                ).iterate();
 
+                let backfillCount = 0;
                 const backfill = this.db.transaction(() => {
-                    for (const row of allExchanges) {
+                    for (const row of iter) {
                         insertFts.run(row.id, row.user_text || '', row.agent_text || '');
+                        backfillCount++;
                     }
                 });
                 backfill();
 
-                console.log(`[Indexer] FTS5 backfill complete: ${allExchanges.length} exchanges indexed`);
+                console.log(`[Indexer] FTS5 backfill complete: ${backfillCount} exchanges indexed`);
             }
         } catch (e) {
             // FTS5 is an enhancement — don't block startup if it fails
@@ -344,7 +351,7 @@ class Indexer {
             console.warn('[Indexer] @chroma-core/default-embed failed:', err.message);
         }
 
-        // Fallback: direct transformers.js
+        // Fallback: direct transformers.js (with tensor disposal)
         try {
             const { pipeline } = require('@huggingface/transformers');
             this._embeddingPipeline = await pipeline('feature-extraction', this.model);
@@ -354,6 +361,10 @@ class Indexer {
                     for (const text of texts) {
                         const output = await this._embeddingPipeline(text, { pooling: 'mean', normalize: true });
                         results.push(Array.from(output.data));
+                        // Dispose ONNX tensor to free native memory
+                        if (typeof output.dispose === 'function') {
+                            output.dispose();
+                        }
                     }
                     return results;
                 }

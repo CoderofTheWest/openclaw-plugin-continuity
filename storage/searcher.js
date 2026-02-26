@@ -26,11 +26,12 @@ class Searcher {
      * @param {object} config - full plugin config
      * @param {string} dataDir - plugin data directory
      * @param {object} db - shared better-sqlite3 database instance (from Indexer)
+     * @param {object} [embeddingProvider] - shared EmbeddingProvider instance (from embedding.js)
      */
-    constructor(config = {}, dataDir, db) {
+    constructor(config = {}, dataDir, db, embeddingProvider = null) {
         this.db = db;
-        this._embeddingFn = null;
-        this._initialized = false;
+        this._embeddingFn = embeddingProvider; // shared provider (preferred)
+        this._initialized = !!embeddingProvider; // ready if provider injected
         this.model = config.embedding?.model || 'Xenova/all-MiniLM-L6-v2';
 
         // Temporal ranking config
@@ -52,35 +53,36 @@ class Searcher {
 
     /**
      * Initialize embedding function for query generation.
-     * If the Indexer has already been initialized, this shares its DB.
-     * Otherwise, creates its own embedding pipeline.
+     * Skipped if a shared EmbeddingProvider was injected via constructor.
+     * Fallback: creates own pipeline with tensor disposal.
      */
     async initialize() {
         if (this._initialized) return;
 
+        // Fallback: direct transformers.js with tensor disposal
+        // (DefaultEmbeddingFunction is NOT used — it re-creates the pipeline
+        //  on every generate() call, which is the primary memory leak source)
         try {
-            const { DefaultEmbeddingFunction } = require('@chroma-core/default-embed');
-            this._embeddingFn = new DefaultEmbeddingFunction();
-            await this._embeddingFn.generate(['warmup']);
-            this._initialized = true;
-        } catch {
-            try {
-                const { pipeline } = require('@huggingface/transformers');
-                const pipe = await pipeline('feature-extraction', this.model);
-                this._embeddingFn = {
-                    generate: async (texts) => {
-                        const results = [];
-                        for (const text of texts) {
-                            const output = await pipe(text, { pooling: 'mean', normalize: true });
-                            results.push(Array.from(output.data));
+            const { pipeline } = require('@huggingface/transformers');
+            const pipe = await pipeline('feature-extraction', this.model);
+            this._embeddingFn = {
+                generate: async (texts) => {
+                    const results = [];
+                    for (const text of texts) {
+                        const output = await pipe(text, { pooling: 'mean', normalize: true });
+                        results.push(Array.from(output.data));
+                        // Dispose ONNX tensor to free native memory
+                        if (typeof output.dispose === 'function') {
+                            output.dispose();
                         }
-                        return results;
                     }
-                };
-                this._initialized = true;
-            } catch (err) {
-                console.error('[Searcher] No embedding model available:', err.message);
-            }
+                    return results;
+                }
+            };
+            this._initialized = true;
+            console.log('[Searcher] Fallback embedding pipeline ready (with tensor disposal)');
+        } catch (err) {
+            console.error('[Searcher] No embedding model available:', err.message);
         }
     }
 

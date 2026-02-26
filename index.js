@@ -110,6 +110,7 @@ module.exports = {
         const Archiver = require('./storage/archiver');
         const Indexer = require('./storage/indexer');
         const Searcher = require('./storage/searcher');
+        const EmbeddingProvider = require('./storage/embedding');
 
         // Shared across agents (stateless utility)
         const tokenEstimator = new TokenEstimator(config.tokenEstimation || {});
@@ -139,6 +140,7 @@ module.exports = {
                 this.archiver = new Archiver(config, this.dataDir);
 
                 // Storage (lazy init — embedding model is expensive)
+                this.embeddingProvider = null;
                 this.indexer = null;
                 this.searcher = null;
                 this.storageReady = false;
@@ -160,20 +162,47 @@ module.exports = {
                 }
                 this.storageInitPromise = (async () => {
                     try {
-                        this.indexer = new Indexer(config, this.dataDir);
+                        // Single shared embedding provider per agent —
+                        // pipeline created once, tensors disposed after each use.
+                        // Fixes memory leak from duplicate pipelines + undisposed tensors.
+                        this.embeddingProvider = new EmbeddingProvider(config.embedding || {});
+                        await this.embeddingProvider.initialize();
+
+                        this.indexer = new Indexer(config, this.dataDir, this.embeddingProvider);
                         await this.indexer.initialize();
-                        this.searcher = new Searcher(config, this.dataDir, this.indexer.db);
-                        await this.searcher.initialize();
+                        this.searcher = new Searcher(config, this.dataDir, this.indexer.db, this.embeddingProvider);
+                        // Searcher skips its own init when provider is injected
                         this.storageReady = true;
-                        api.logger.info(`[Continuity] Storage ready for agent "${this.agentId}" at ${this.dataDir}`);
+                        api.logger.info(`[Continuity] Storage ready for agent "${this.agentId}" at ${this.dataDir} (shared embedding provider)`);
                     } catch (err) {
                         api.logger.error(`[Continuity] Storage init failed for agent "${this.agentId}": ${err.message}`);
+                        this.embeddingProvider = null;
                         this.indexer = null;
                         this.searcher = null;
                     }
                 })();
                 await this.storageInitPromise;
                 this.storageInitPromise = null;
+            }
+
+            /**
+             * Release all resources held by this agent state.
+             * Called on session_end to prevent unbounded memory growth.
+             */
+            close() {
+                if (this.embeddingProvider) {
+                    this.embeddingProvider.dispose();
+                    this.embeddingProvider = null;
+                }
+                if (this.indexer) {
+                    this.indexer.close();
+                    this.indexer = null;
+                }
+                this.searcher = null;
+                this.lastRetrievalCache = null;
+                this.storageReady = false;
+                this.storageInitPromise = null;
+                api.logger.info(`[Continuity] Resources released for agent "${this.agentId}"`);
             }
         }
 
@@ -551,6 +580,9 @@ module.exports = {
                 console.error(`[Continuity:${state.agentId}] Incremental index failed: ${err.message}`);
             }
 
+            // Clear retrieval cache — it's per-turn, no longer needed after archiving.
+            state.lastRetrievalCache = null;
+
             // Session state (topics, anchors) is delivered via prependContext each turn.
             // MEMORY.md is left for the agent to curate per AGENTS.md instructions.
         });
@@ -623,6 +655,14 @@ module.exports = {
             } catch (err) {
                 api.logger.warn(`Session-end indexing failed for agent "${state.agentId}": ${err.message}`);
             }
+
+            // Release resources: embedding pipeline, DB connections, caches.
+            // The state will be lazily re-created on next session start.
+            // This is the primary fix for the memory leak — without cleanup,
+            // each agent accumulates ~200-400MB of ONNX pipeline + DB state
+            // that is never released.
+            state.close();
+            agentStates.delete(state.agentId);
         });
 
         // -------------------------------------------------------------------
