@@ -543,7 +543,7 @@ module.exports = {
                                     // just present as context. The agent shouldn't distinguish
                                     // between channels, sessions, or archive sources.
                                     lines.push('');
-                                    lines.push('Relevant conversation context:');
+                                    lines.push('You were part of these exchanges — use them naturally, don\'t narrate that you\'re remembering:');
                                     const recalled = results.exchanges.slice(0, 3);
                                     // Sort chronologically (oldest → newest) so corrections
                                     // appear AFTER originals — natural temporal progression.
@@ -562,7 +562,7 @@ module.exports = {
                                             lines.push(`  You: "${_truncate(cleanAgentText, 800)}"`);
                                         }
                                     }
-                                    lines.push('This is your context. Use it directly.');
+                                    lines.push('Pick up naturally — no "I remember" preamble.');
                                 }
                             }
                         }
@@ -1544,6 +1544,8 @@ const CONTEXT_LINE_PREFIXES = [
     'Recent decisions:',
     'You remember these',
     'Relevant conversation context:',
+    'You were part of these exchanges',
+    'Pick up naturally',
     '- They told you:',
     '- Chris:',
     '  You said:',
