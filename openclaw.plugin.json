@@ -93,6 +93,45 @@
           "dimensions": { "type": "number", "default": 384 }
         }
       },
+      "summarization": {
+        "type": "object",
+        "description": "Hierarchical summarization on compaction — generates summary DAG from compacted conversations",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "llm": {
+            "type": "object",
+            "description": "LLM endpoint for Tier 2 abstractive summaries (async, entropy-gated)",
+            "properties": {
+              "endpoint": { "type": "string", "default": "http://127.0.0.1:11434/v1/chat/completions" },
+              "model": { "type": "string", "description": "Model name (null = endpoint default)" },
+              "temperature": { "type": "number", "default": 0.3 },
+              "maxTokens": { "type": "number", "default": 500 },
+              "timeoutMs": { "type": "number", "default": 30000 }
+            }
+          },
+          "maxDepth": { "type": "number", "default": 3, "description": "Max DAG depth (1=leaves only, 2=+branches, 3=+roots)" },
+          "leafCondenseThreshold": { "type": "number", "default": 6, "description": "Leaf summaries before triggering branch condensation" },
+          "branchCondenseThreshold": { "type": "number", "default": 6, "description": "Branch summaries before triggering root condensation" },
+          "extractiveMaxSentences": { "type": "number", "default": 8, "description": "Max sentences in Tier 1 extractive summary" },
+          "entropyRichThreshold": { "type": "number", "default": 0.6, "description": "Entropy threshold for Tier 2 LLM enrichment" }
+        }
+      },
+      "knowledge": {
+        "type": "object",
+        "description": "Operational knowledge indexing — indexes workspace .md files into a semantic store and passively injects relevant knowledge during conversation",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true },
+          "maxEntriesPerInjection": { "type": "number", "default": 3, "description": "Max knowledge entries injected per turn" },
+          "maxEntryChars": { "type": "number", "default": 600, "description": "Max characters per injected entry" },
+          "maxInjectionChars": { "type": "number", "default": 1800, "description": "Total character budget for knowledge injection (separate from conversation recall)" },
+          "relevanceThreshold": { "type": "number", "default": 1.0, "description": "Semantic distance threshold for injection (lower = more selective)" },
+          "skipFiles": { "type": "array", "items": { "type": "string" }, "description": "Workspace files to skip (identity/relational — always in bootstrap)" },
+          "skipSections": { "type": "array", "items": { "type": "string" }, "description": "Section headers to skip (infrastructure, not knowledge)" },
+          "indexOnSessionStart": { "type": "boolean", "default": true, "description": "Re-index workspace files when a session starts" },
+          "bulletLevelChunking": { "type": "boolean", "default": true, "description": "Split sections into bullet-level entries for finer granularity" },
+          "minSectionCharsForSplit": { "type": "number", "default": 200, "description": "Sections shorter than this stay atomic (not split into bullets)" }
+        }
+      },
       "session": {
         "type": "object",
         "description": "Session boundary detection",

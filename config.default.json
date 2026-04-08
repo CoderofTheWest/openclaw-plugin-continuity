@@ -67,6 +67,40 @@
     "dbFile": "continuity.db"
   },
 
+  "summarization": {
+    "enabled": true,
+    "llm": {
+      "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+      "model": null,
+      "temperature": 0.3,
+      "maxTokens": 500,
+      "timeoutMs": 30000
+    },
+    "maxDepth": 3,
+    "leafCondenseThreshold": 6,
+    "branchCondenseThreshold": 6,
+    "extractiveMaxSentences": 8,
+    "entropyRichThreshold": 0.6
+  },
+
+  "knowledge": {
+    "enabled": true,
+    "maxEntriesPerInjection": 3,
+    "maxEntryChars": 600,
+    "maxInjectionChars": 1800,
+    "relevanceThreshold": 1.2,
+    "skipFiles": ["SOUL.md", "BOOTSTRAP.md", "IDENTITY.md", "CHRIS.md", "USER.md", "MEMORY.md"],
+    "skipSections": [
+      "First Run", "Every Session", "Memory", "Recovery Protocol",
+      "Your Workspace", "Safety", "Task Transparency",
+      "Default Tool Usage", "Shell Access", "Agent Mode Rules",
+      "Make It Yours", "Office Hours"
+    ],
+    "indexOnSessionStart": true,
+    "bulletLevelChunking": true,
+    "minSectionCharsForSplit": 200
+  },
+
   "search": {
     "recencyHalfLifeDays": 14,
     "recencyWeight": 0.15,
@@ -79,6 +113,12 @@
   "session": {
     "interruptedGap": 7200000,
     "newSessionGap": 21600000
+  },
+
+  "sessionHandoff": {
+    "enabled": true,
+    "compactionThreshold": 3,
+    "workspacePath": null
   },
 
   "continuityIndicators": [

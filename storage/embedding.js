@@ -105,6 +105,17 @@ class EmbeddingProvider {
     }
 
     /**
+     * Embed a single text string. Convenience wrapper around generate().
+     *
+     * @param {string} text - single text to embed
+     * @returns {Promise<number[]>} embedding vector
+     */
+    async embed(text) {
+        const [embedding] = await this.generate([text]);
+        return embedding;
+    }
+
+    /**
      * Release the pipeline and all associated resources.
      * Call this when the agent session ends.
      */

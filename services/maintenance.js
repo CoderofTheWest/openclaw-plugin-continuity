@@ -16,11 +16,14 @@ class MaintenanceService {
      * @param {object} config - full plugin config
      * @param {object} archiver - shared Archiver instance
      * @param {object} indexer - shared Indexer instance (already initialized)
+     * @param {object} [summarizer] - optional Summarizer instance for queue processing + condensation
      */
-    constructor(config = {}, archiver, indexer) {
+    constructor(config = {}, archiver, indexer, summarizer = null, agentId = 'main') {
         this.config = config;
         this.archiver = archiver;
         this.indexer = indexer;
+        this.summarizer = summarizer;
+        this._agentId = agentId;
         this.batchDelay = config.archive?.batchIndexDelay || 100;
 
         this._lastRun = null;
@@ -73,14 +76,32 @@ class MaintenanceService {
             report.errors.push(`Prune: ${err.message}`);
         }
 
-        // 3. Archive stats
+        // 3. Process summarization queue + condensation
+        if (this.summarizer) {
+            try {
+                const queueResult = await this.summarizer.processQueue(3);
+                report.summaryQueue = queueResult;
+            } catch (err) {
+                report.errors.push(`Summary queue: ${err.message}`);
+            }
+
+            try {
+                // Condense accumulated leaf/branch summaries into higher-level summaries
+                // Uses 'main' as default agentId — maintenance runs per-agent from index.js
+                await this.summarizer.maybeCondense(this._agentId || 'main');
+            } catch (err) {
+                report.errors.push(`Summary condensation: ${err.message}`);
+            }
+        }
+
+        // 4. Archive stats
         try {
             report.archiveStats = this.archiver.getStats();
         } catch (err) {
             report.errors.push(`Stats: ${err.message}`);
         }
 
-        // 4. Log health
+        // 5. Log health
         const exchangeCount = this.indexer.getExchangeCount();
         if (report.errors.length === 0) {
             console.log(

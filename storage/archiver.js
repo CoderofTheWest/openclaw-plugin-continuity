@@ -34,9 +34,10 @@ class Archiver {
      * Archive messages — group by date, deduplicate, write.
      *
      * @param {Array} messages - conversation messages
+     * @param {Object} opts - options (sessionId, etc.)
      * @returns {{ archived: number, dates: string[] }}
      */
-    archive(messages) {
+    archive(messages, opts = {}) {
         if (!messages || messages.length === 0) {
             return { archived: 0, dates: [] };
         }
@@ -47,7 +48,8 @@ class Archiver {
             .map(m => ({
                 timestamp: this._normalizeTimestamp(m.timestamp),
                 sender: m.role === 'user' ? 'user' : 'agent',
-                text: this._extractText(m)
+                text: this._extractText(m),
+                sessionId: opts.sessionId || null
             }));
 
         // Group by date

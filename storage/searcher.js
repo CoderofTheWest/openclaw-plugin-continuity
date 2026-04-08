@@ -49,6 +49,10 @@ class Searcher {
         // FTS5 availability (checked on first search)
         this._fts5Checked = false;
         this._fts5Available = false;
+
+        // Summary search availability (checked on first search)
+        this._summarySearchChecked = false;
+        this._summarySearchAvailable = false;
     }
 
     /**
@@ -100,9 +104,12 @@ class Searcher {
      *
      * @param {string} query - natural language search query
      * @param {number} [limit=5] - max results to return
+     * @param {string} [agentId] - agent ID for graph results
+     * @param {object} [scope] - optional spatial scope filter
+     * @param {string[]} [scope.topics] - topic tags to filter by (OR logic)
      * @returns {{ exchanges: Array, distances: number[] }}
      */
-    async search(query, limit = 5, agentId) {
+    async search(query, limit = 5, agentId, scope = null) {
         if (!this.db) {
             return { exchanges: [], distances: [], error: 'Database not available' };
         }
@@ -133,6 +140,12 @@ class Searcher {
             // Pick up graph results from the graph plugin (if running)
             const graphResults = agentId ? this._getGraphResults(agentId) : [];
 
+            // Search summary DAG (if available)
+            if (!this._summarySearchChecked) this._checkSummarySearch();
+            const summaryResults = this._summarySearchAvailable
+                ? await this._summarySearch(query, Math.ceil(fetchLimit / 2))
+                : [];
+
             // Build exchange lookup (all candidates from all lists)
             const exchangeMap = new Map();
             for (const r of semanticResults) {
@@ -148,12 +161,22 @@ class Searcher {
                     exchangeMap.set(r.id, r);
                 }
             }
+            for (const r of summaryResults) {
+                if (!exchangeMap.has(r.id)) {
+                    exchangeMap.set(r.id, r);
+                }
+            }
 
-            // Fuse ranked lists with RRF (3-way when graph results are available)
+            // Fuse ranked lists with RRF (4-way when summary + graph results are available)
             const rrfScores = this._reciprocalRankFusion(
-                [semanticResults, keywordResults, graphResults],
+                [semanticResults, keywordResults, graphResults, summaryResults],
                 this._rrfK
             );
+
+            // Build scope tag set for spatial filtering boost
+            const scopeTopics = scope?.topics?.length
+                ? new Set(scope.topics.map(t => t.toLowerCase()))
+                : null;
 
             // Apply temporal decay and build final results
             const now = Date.now();
@@ -187,6 +210,17 @@ class Searcher {
                 } else {
                     // Standard scoring for ongoing (new) memories
                     compositeScore = rrfScore * (1 + recencyBoost);
+                }
+
+                // Spatial scope boost: if the exchange's topic tags overlap with
+                // the requested scope, boost its score. This is a soft filter —
+                // unscoped results still appear but rank lower when scope is active.
+                if (scopeTopics) {
+                    const tags = (ex.topicTags || ex.topic_tags || '').toLowerCase().split(',').filter(Boolean);
+                    const hasOverlap = tags.some(t => scopeTopics.has(t));
+                    if (hasOverlap) {
+                        compositeScore *= 1.5; // 50% boost for scope match
+                    }
                 }
 
                 fused.push({
@@ -312,6 +346,79 @@ class Searcher {
     }
 
     // ---------------------------------------------------------------
+    // Summary search (4th lane)
+    // ---------------------------------------------------------------
+
+    /**
+     * Check if vec_summaries table exists.
+     */
+    _checkSummarySearch() {
+        this._summarySearchChecked = true;
+        try {
+            const row = this.db.prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_summaries'"
+            ).get();
+            this._summarySearchAvailable = !!row;
+            if (this._summarySearchAvailable) {
+                console.log('[Searcher] Summary search enabled (4-way hybrid mode)');
+            }
+        } catch {
+            this._summarySearchAvailable = false;
+        }
+    }
+
+    /**
+     * Semantic search through summary DAG via vec_summaries.
+     * Returns summary results formatted as pseudo-exchanges for RRF fusion.
+     * Summaries get lower natural weight because they're contextual, not exact recall.
+     *
+     * @param {string} query
+     * @param {number} limit
+     * @returns {Array} ranked results compatible with RRF input
+     */
+    async _summarySearch(query, limit) {
+        try {
+            const embeddings = await this._embeddingFn.generate([query]);
+            const queryEmbedding = embeddings?.[0];
+            if (!queryEmbedding) return [];
+
+            const results = this.db.prepare(`
+                SELECT
+                    s.id,
+                    s.summary_text,
+                    s.date_range_start,
+                    s.date_range_end,
+                    s.topics,
+                    s.message_count,
+                    s.level,
+                    s.metadata,
+                    s.created_at,
+                    v.distance
+                FROM vec_summaries v
+                JOIN summaries s ON s.id = v.id
+                WHERE v.embedding MATCH ?
+                AND k = ?
+                ORDER BY v.distance ASC
+            `).all(new Float32Array(queryEmbedding), limit);
+
+            return results.map(r => ({
+                id: r.id,
+                date: r.date_range_start,
+                exchangeIndex: 0,
+                userText: null,
+                agentText: r.summary_text,
+                combined: r.summary_text,
+                metadata: { ...this._parseMetadata(r.metadata), isSummary: true, level: r.level },
+                createdAt: r.created_at,
+                distance: r.distance
+            }));
+        } catch (err) {
+            console.warn('[Searcher] Summary search failed:', err.message);
+            return [];
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Search strategies
     // ---------------------------------------------------------------
 
@@ -337,6 +444,7 @@ class Searcher {
                 e.date,
                 e.exchange_index,
                 e.metadata,
+                e.topic_tags,
                 e.created_at,
                 v.distance
             FROM vec_exchanges v
@@ -354,6 +462,7 @@ class Searcher {
             agentText: r.agent_text,
             combined: r.combined,
             metadata: this._parseMetadata(r.metadata),
+            topicTags: r.topic_tags || '',
             createdAt: r.created_at,
             distance: r.distance
         }));
@@ -387,6 +496,7 @@ class Searcher {
                     e.date,
                     e.exchange_index,
                     e.metadata,
+                    e.topic_tags,
                     e.created_at,
                     bm25(fts_exchanges) AS bm25_score
                 FROM fts_exchanges f
@@ -404,6 +514,7 @@ class Searcher {
                 agentText: r.agent_text,
                 combined: r.combined,
                 metadata: this._parseMetadata(r.metadata),
+                topicTags: r.topic_tags || '',
                 createdAt: r.created_at,
                 distance: null, // no vector distance for keyword results
                 bm25Score: r.bm25_score
