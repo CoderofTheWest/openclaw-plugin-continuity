@@ -82,9 +82,11 @@ class Indexer {
      *
      * @param {string} date - YYYY-MM-DD
      * @param {Array} messages - messages from the archiver
+     * @param {object} [options] - optional indexing metadata
+     * @param {string[]} [options.topicTags] - topic labels from TopicTracker for spatial scoping
      * @returns {{ indexed: number, date: string }}
      */
-    async indexDay(date, messages) {
+    async indexDay(date, messages, options = {}) {
         if (!this._initialized) {
             throw new Error('Indexer not initialized. Call initialize() first.');
         }
@@ -98,9 +100,12 @@ class Indexer {
 
         const insertExchange = this.db.prepare(`
             INSERT OR REPLACE INTO exchanges
-            (id, date, exchange_index, user_text, agent_text, combined, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            (id, date, exchange_index, user_text, agent_text, combined, metadata, topic_tags, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         `);
+
+        // Topic tags for spatial scoping (from TopicTracker)
+        const topicTagsStr = (options.topicTags || []).join(',');
 
         // sqlite-vec virtual tables don't support INSERT OR REPLACE,
         // so delete first then insert
@@ -135,7 +140,7 @@ class Indexer {
                     hasAgent: !!exchange.agent
                 });
 
-                const userText = exchange.user?.text || '';
+                const userText = this._sanitizeForIndex(exchange.user?.text || '');
                 const agentText = exchange.agent?.text || '';
 
                 const transaction = this.db.transaction(() => {
@@ -144,7 +149,8 @@ class Indexer {
                         userText,
                         agentText,
                         combined,
-                        metadata
+                        metadata,
+                        topicTagsStr
                     );
                     deleteVec.run(id);
                     insertVec.run(id, new Float32Array(embedding));
@@ -247,6 +253,7 @@ class Indexer {
                 agent_text TEXT,
                 combined TEXT,
                 metadata TEXT,
+                topic_tags TEXT DEFAULT '',
                 created_at TEXT DEFAULT (datetime('now'))
             )
         `);
@@ -254,6 +261,14 @@ class Indexer {
         this.db.exec(`
             CREATE INDEX IF NOT EXISTS idx_exchanges_date ON exchanges(date);
         `);
+
+        // Add topic_tags column if upgrading from older schema
+        try {
+            this.db.exec(`ALTER TABLE exchanges ADD COLUMN topic_tags TEXT DEFAULT ''`);
+        } catch (e) {
+            // Column already exists — expected for existing databases
+            if (!e.message.includes('duplicate column')) throw e;
+        }
 
         // Vector table
         try {
@@ -425,6 +440,41 @@ class Indexer {
     }
 
     /**
+     * Lightweight re-strip for index-time safety net.
+     * Catches context block content that leaked through the primary strip
+     * in agent_end (e.g., [PROJECT CONTEXT] body, workspace file references).
+     * Not a full replacement for _stripContextBlocks — just catches obvious leaks.
+     */
+    _sanitizeForIndex(text) {
+        if (!text) return '';
+
+        // If text starts with a known context block header, it's entirely polluted
+        const BLOCK_HEADERS = [
+            '[CONTINUITY CONTEXT]', '[STABILITY CONTEXT]', '[PROJECT CONTEXT',
+            '[CONTEMPLATION STATE]', '[NIGHTSHIFT REPORT', '[ARCHIVE RETRIEVAL]',
+            '[GRAPH CONTEXT]', '[GRAPH NOTE]', '[TOPIC NOTE]',
+        ];
+        if (BLOCK_HEADERS.some(h => text.startsWith(h))) {
+            // Try to find user text after a timestamp
+            const tsMatch = text.match(/\n\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s\d{4}-\d{2}-\d{2}\s[^\]]*\]\s*/g);
+            if (tsMatch) {
+                const lastTs = tsMatch[tsMatch.length - 1];
+                const idx = text.lastIndexOf(lastTs);
+                return text.substring(idx + lastTs.length).trim();
+            }
+            // No timestamp — this is entirely context (e.g., heartbeat)
+            return '';
+        }
+
+        // If text contains workspace file references as primary content, it's polluted
+        if (/^# Project:/.test(text) || /^## Stack\b/.test(text) || /^## Architecture\b/.test(text)) {
+            return '';
+        }
+
+        return text;
+    }
+
+    /**
      * Format an exchange for embedding.
      * @param {object} exchange - { user, agent }
      * @param {string} date
@@ -436,7 +486,7 @@ class Indexer {
         const parts = [`[${date} ${time}]`];
 
         if (exchange.user?.text) {
-            parts.push(`User: ${exchange.user.text}`);
+            parts.push(`User: ${this._sanitizeForIndex(exchange.user.text)}`);
         }
         if (exchange.agent?.text) {
             parts.push(`Agent: ${exchange.agent.text}`);
