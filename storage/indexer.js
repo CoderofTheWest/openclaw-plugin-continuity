@@ -100,12 +100,13 @@ class Indexer {
 
         const insertExchange = this.db.prepare(`
             INSERT OR REPLACE INTO exchanges
-            (id, date, exchange_index, user_text, agent_text, combined, metadata, topic_tags, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            (id, date, exchange_index, user_text, agent_text, combined, metadata, topic_tags, thread_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         `);
 
         // Topic tags for spatial scoping (from TopicTracker)
         const topicTagsStr = (options.topicTags || []).join(',');
+        const threadId = options.threadId || null;
 
         // sqlite-vec virtual tables don't support INSERT OR REPLACE,
         // so delete first then insert
@@ -150,7 +151,8 @@ class Indexer {
                         agentText,
                         combined,
                         metadata,
-                        topicTagsStr
+                        topicTagsStr,
+                        threadId
                     );
                     deleteVec.run(id);
                     insertVec.run(id, new Float32Array(embedding));
@@ -269,6 +271,14 @@ class Indexer {
             // Column already exists — expected for existing databases
             if (!e.message.includes('duplicate column')) throw e;
         }
+
+        // Add thread_id column for infinite thread scoping
+        try {
+            this.db.exec(`ALTER TABLE exchanges ADD COLUMN thread_id TEXT DEFAULT NULL`);
+        } catch (e) {
+            if (!e.message.includes('duplicate column')) throw e;
+        }
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_exchanges_thread ON exchanges(thread_id)`);
 
         // Vector table
         try {

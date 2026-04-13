@@ -164,6 +164,12 @@ module.exports = {
                 this.compactionCount = 0;
                 this.handoffWritten = false;
 
+                // Thread state (infinite threads)
+                this.currentThreadId = 'main';
+                this.threadHandoffInjected = false;
+                this.threadCompactionCount = 0;
+                this.consolidationPending = false;
+
                 // Retrieval cache (per-agent, per-turn)
                 this.lastRetrievalCache = null;
             }
@@ -346,6 +352,45 @@ module.exports = {
             currentAgentId = ctx.agentId || 'main';
             const state = getAgentState(ctx.agentId);
 
+            // ── Thread scoping (infinite threads) ──
+            // Extract thread_id from the prompt text.
+            // The gateway doesn't pass request metadata to plugin hooks (event only has 'prompt' as string).
+            // The GUI embeds thread_id as a marker in the message: [THREAD:session_1234567890]
+            let threadIdFromPrompt = null;
+            if (typeof event.prompt === 'string') {
+                const threadMatch = event.prompt.match(/\[THREAD:([^\]]+)\]/);
+                if (threadMatch) {
+                    threadIdFromPrompt = threadMatch[1];
+                }
+            }
+            const threadId = threadIdFromPrompt || ctx.threadId || event.metadata?.thread_id || ctx.metadata?.thread_id || 'main';
+
+            // Detect thread switch — write handoff for outgoing thread BEFORE switching
+            if (state.currentThreadId !== threadId && state.currentThreadId !== 'main') {
+                _writeSessionHandoff(state, config, ctx, api);
+                state.threadHandoffInjected = false;
+                state.threadCompactionCount = 0;
+            }
+            state.currentThreadId = threadId;
+
+            // Resolve workspace path for thread handoff operations
+            const handoffConfig = config.sessionHandoff || {};
+            const workspacePath = handoffConfig.workspacePath ||
+                ctx.workspaceDir ||
+                process.env.OPENCLAW_WORKSPACE ||
+                path.join(require('os').homedir(), '.openclaw', 'workspace-clint');
+
+            // Restore persisted thread state from handoff file header (survives gateway restarts)
+            if (threadId !== 'main' && state.threadCompactionCount === 0) {
+                const persistedState = _readThreadStateFromHandoff(threadId, workspacePath);
+                if (persistedState) {
+                    state.threadCompactionCount = persistedState.compactionCount || 0;
+                }
+            }
+
+            // Stash event metadata for handoff writer (mode detection)
+            state._lastEventMetadata = event.metadata || {};
+
             // Write handoff BEFORE exchange starts so crashes don't lose state
             // This ensures we have a handoff even if the exchange fails mid-stream
             _writeSessionHandoff(state, config, ctx, api);
@@ -378,16 +423,29 @@ module.exports = {
                         ? event.prompt.filter(p => p.role === 'user').pop()?.content || ''
                         : '';
                 if (typeof promptStr === 'string' && promptStr.length > 0) {
-                    // Find the last timestamp marker — user text follows it
+                    // Strategy 1: Find [THREAD:...] marker — GUI embeds it at start of user message
+                    const threadMarkerIdx = promptStr.lastIndexOf('[THREAD:');
+                    if (threadMarkerIdx >= 0) {
+                        const afterMarker = promptStr.substring(threadMarkerIdx);
+                        // Skip past the marker itself: [THREAD:session_xxx]
+                        const markerEnd = afterMarker.indexOf(']');
+                        if (markerEnd >= 0) {
+                            lastUserText = afterMarker.substring(markerEnd + 1).trim();
+                        }
+                    }
+                    // Strategy 2: Find the last timestamp marker — user text follows it
                     // e.g. [Mon 2026-03-09 20:12 PDT] actual message here
-                    const tsRegex = /\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s\d{4}-\d{2}-\d{2}\s[^\]]*\]\s*/g;
-                    let lastTs = null;
-                    let m;
-                    while ((m = tsRegex.exec(promptStr)) !== null) lastTs = m;
-                    if (lastTs) {
-                        lastUserText = promptStr.substring(lastTs.index + lastTs[0].length).trim();
-                    } else {
-                        // No timestamp — take the last meaningful chunk
+                    if (!lastUserText) {
+                        const tsRegex = /\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s\d{4}-\d{2}-\d{2}\s[^\]]*\]\s*/g;
+                        let lastTs = null;
+                        let m;
+                        while ((m = tsRegex.exec(promptStr)) !== null) lastTs = m;
+                        if (lastTs) {
+                            lastUserText = promptStr.substring(lastTs.index + lastTs[0].length).trim();
+                        }
+                    }
+                    // Strategy 3: Last resort — take the last meaningful chunk
+                    if (!lastUserText) {
                         const trimmed = promptStr.slice(-2000).trim();
                         if (trimmed.length >= 10) {
                             lastUserText = trimmed;
@@ -455,6 +513,48 @@ module.exports = {
                 api.logger.info(`[Continuity:${state.agentId}] Nightshift report injected into context`);
             }
 
+            // ── Thread-specific handoff injection (infinite threads) ──
+            // Load persistent thread state on first exchange in this thread.
+            // Unlike session handoff (one-shot, deleted after read), thread handoffs
+            // are persistent state — NOT deleted after injection.
+            if (!state.threadHandoffInjected && state.currentThreadId !== 'main') {
+                const threadHandoffPath = path.join(workspacePath,
+                    `SESSION_HANDOFF_${state.currentThreadId}.md`);
+                if (fs.existsSync(threadHandoffPath)) {
+                    const threadHandoff = fs.readFileSync(threadHandoffPath, 'utf8');
+
+                    // Generate LLM warm start summary
+                    const warmStart = await _generateWarmStart(
+                        threadHandoff, state.currentThreadId, state, config, api
+                    );
+
+                    lines.push('');
+                    lines.push('[THREAD CONTEXT — persistent state for this project thread]');
+                    if (warmStart) {
+                        lines.push(warmStart);
+                        lines.push('');
+                    }
+                    lines.push(threadHandoff);
+                    lines.push('[/THREAD CONTEXT]');
+                    lines.push('');
+
+                    state.threadHandoffInjected = true;
+                    api.logger.info(`[Continuity:${state.agentId}] Thread handoff injected for thread ${state.currentThreadId}${warmStart ? ' (with warm start)' : ''}`);
+                }
+            }
+
+            // ── Consolidation notice (infinite threads) ──
+            // If compaction threshold was hit, notify the agent to wrap up gracefully.
+            if (state.consolidationPending) {
+                lines.push('');
+                lines.push('[CONSOLIDATION NOTICE]');
+                lines.push('This thread has been running for a while. The system will refresh ');
+                lines.push('your context after this exchange to maintain quality. Wrap up any ');
+                lines.push('immediate points — your thread state is saved and you will pick up ');
+                lines.push('where you left off.');
+                lines.push('[/CONSOLIDATION NOTICE]');
+            }
+
             // Topic tracking is NO LONGER injected into context.
             // The data is still collected and available via:
             //   - continuity.getTopics gateway method (debugging/dashboards)
@@ -490,7 +590,7 @@ module.exports = {
             //   - Explicit recall intent → always inject (even weak matches)
             //   - No intent but strong semantic match → inject (implicit relevance)
             //   - No intent, weak match → cache only (warm for tool_result_persist)
-            const cleanUserText = _stripContextBlocks(lastUserText);
+            let cleanUserText = _stripContextBlocks(lastUserText);
             const lowerUser = cleanUserText.toLowerCase();
             const hasContinuityIntent = continuityIndicators.some(ind =>
                 lowerUser.includes(ind)
@@ -501,9 +601,34 @@ module.exports = {
             // distance < 1.0 = reasonably relevant match. RRF compositeScore is used
             // for ranking but distance remains the interpretable relevance signal.
             const DISTANCE_THRESHOLD = 1.0;
-            // Debug: uncomment to inspect event structure
-            // if (!cleanUserText) console.error(`[Continuity:${state.agentId}] Empty text — event keys: ${Object.keys(event).join(', ')}`)
-            console.error(`[Continuity:${state.agentId}] Search: intent=${hasContinuityIntent}, len=${cleanUserText.length}, query="${cleanUserText.substring(0, 80)}"`);
+            // Diagnostic: file-based logging since gateway stderr isn't captured
+            const _debugRetrieval = (msg) => { try { fs.appendFileSync('/tmp/continuity-retrieval.log', `${new Date().toISOString()} ${msg}\n`); } catch(e) {} };
+
+            // Strip session start marker from search text — noise in embeddings
+            cleanUserText = cleanUserText.replace(/\[SESSION START[^\]]*\]\s*/g, '');
+
+            // If the prompt contains multi-message catch-up context, extract just the LAST user message.
+            // The gateway packages missed messages as: "Assistant: ...\nChris: ...\nAssistant: ...\nChris: actual message"
+            // Find the LAST user turn boundary using all known user labels.
+            if (cleanUserText.length > 500) {
+                // Find all user turn boundaries, take the last one
+                const userTurnPattern = /\n(?:Chris|User|Human):\s*/gi;
+                let lastMatch = null;
+                let m;
+                while ((m = userTurnPattern.exec(cleanUserText)) !== null) {
+                    lastMatch = m;
+                }
+                if (lastMatch) {
+                    cleanUserText = cleanUserText.substring(lastMatch.index + lastMatch[0].length).trim();
+                    _debugRetrieval(`Extracted LAST user turn from multi-msg context: len=${cleanUserText.length}`);
+                } else {
+                    // No turn boundary found — take last 400 chars as fallback
+                    cleanUserText = cleanUserText.slice(-400).trim();
+                    _debugRetrieval(`Truncated long query to last 400 chars`);
+                }
+            }
+
+            _debugRetrieval(`Search: intent=${hasContinuityIntent}, len=${cleanUserText.length}, query="${cleanUserText.substring(0, 120)}", thread=${state.currentThreadId}`);
 
             // Always ensure storage is ready (needed for both search and knowledge injection)
             try {
@@ -512,6 +637,7 @@ module.exports = {
                 console.error(`[Continuity:${state.agentId}] Storage init failed: ${storageErr.message}`);
             }
 
+            _debugRetrieval(`storageReady=${state.storageReady}, searcher=${!!state.searcher}, indexer=${!!state.indexer}`);
             if (cleanUserText.length >= 10) {
                 try {
                     if (state.searcher) {
@@ -521,21 +647,69 @@ module.exports = {
                             ? state.topicTracker.getAllTopics().slice(0, 3).map(t => t.topic)
                             : [];
                         const searchScope = activeTopics.length > 0 ? { topics: activeTopics } : null;
-                        const results = await state.searcher.search(cleanUserText, 30, state.agentId, searchScope);
-                        console.error(`[Continuity:${state.agentId}] Search returned ${results?.exchanges?.length || 0} raw results`);
+                        const results = await state.searcher.search(cleanUserText, 30, state.agentId, searchScope, state.currentThreadId);
+                        _debugRetrieval(`Search returned ${results?.exchanges?.length || 0} raw results, error=${results?.error || 'none'}`);
                         if (results?.exchanges?.length > 0) {
                             results.exchanges = _filterUsefulExchanges(results.exchanges);
-                            console.error(`[Continuity:${state.agentId}] After filter: ${results.exchanges.length} useful results`);
+                            _debugRetrieval(`After filter: ${results.exchanges.length} useful results`);
                             if (results.exchanges.length > 0) {
                                 // Always cache for tool_result_persist enrichment
                                 state.lastRetrievalCache = results;
 
                                 // Inject into prependContext if:
                                 // 1. Explicit continuity intent (user asking about past), OR
-                                // 2. Top result is semantically relevant (distance below threshold)
+                                // 2. Top result is semantically relevant (distance below threshold), OR
+                                // 3. Proper noun / keyword overlap — user mentions a name or term
+                                //    that appears in a result (catches "Benjamin Lucas" etc.)
                                 const topDistance = results.exchanges[0].distance ?? 1.0;
-                                const shouldInject = hasContinuityIntent || topDistance < DISTANCE_THRESHOLD;
-                                console.error(`[Continuity:${state.agentId}] topDistance=${topDistance.toFixed(3)}, threshold=${DISTANCE_THRESHOLD}, inject=${shouldInject}`);
+
+                                // Sparse corpus adjustment: when the index has few exchanges,
+                                // distances are naturally higher because the embedding space is less dense.
+                                // With 15k+ exchanges (like Clint production), most queries land under 1.0.
+                                // With <2000 exchanges, use a relaxed threshold so context still flows.
+                                let effectiveThreshold = DISTANCE_THRESHOLD;
+                                try {
+                                    const exchangeCount = state.indexer?.db?.prepare('SELECT COUNT(*) as c FROM exchanges').get()?.c || 0;
+                                    if (exchangeCount < 2000) {
+                                        effectiveThreshold = 1.3; // relaxed for sparse corpus
+                                        _debugRetrieval(`Sparse corpus (${exchangeCount} exchanges) — threshold relaxed to ${effectiveThreshold}`);
+                                    }
+                                } catch(e) { /* fall through to default threshold */ }
+
+                                // Check for keyword overlap: extract notable terms from user text
+                                // and see if any result contains them.
+                                // Catches proper nouns ("Benjamin Lucas"), names with articles
+                                // ("Code of the West"), and single capitalized terms ("Amundi").
+                                let hasKeywordOverlap = false;
+                                const keyTerms = new Set();
+                                // Multi-word capitalized sequences (consecutive caps)
+                                const multiCaps = cleanUserText.match(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/g) || [];
+                                multiCaps.forEach(t => keyTerms.add(t.toLowerCase()));
+                                // Capitalized words with articles/preps between them
+                                // e.g. "Code of the West", "Bank of America"
+                                const capsWithArticles = cleanUserText.match(/[A-Z][a-z]+(?:\s+(?:of|the|and|for|in|on|at|by|de|la|le|von|van)\s+[A-Za-z]+)+/gi) || [];
+                                capsWithArticles.forEach(t => keyTerms.add(t.toLowerCase()));
+                                // Single capitalized words that aren't sentence starters
+                                // (check if preceded by lowercase or punctuation+space)
+                                const singleCaps = cleanUserText.match(/(?<=[a-z.,;:!?]\s)[A-Z][a-z]{2,}/g) || [];
+                                singleCaps.forEach(t => keyTerms.add(t.toLowerCase()));
+
+                                if (keyTerms.size > 0) {
+                                    for (const term of keyTerms) {
+                                        for (const ex of results.exchanges.slice(0, 10)) {
+                                            const combined = ((ex.userText || '') + ' ' + (ex.agentText || '')).toLowerCase();
+                                            if (combined.includes(term)) {
+                                                hasKeywordOverlap = true;
+                                                _debugRetrieval(`Keyword overlap: "${term}" found in result ${ex.id}`);
+                                                break;
+                                            }
+                                        }
+                                        if (hasKeywordOverlap) break;
+                                    }
+                                }
+
+                                const shouldInject = hasContinuityIntent || topDistance < effectiveThreshold || hasKeywordOverlap;
+                                _debugRetrieval(`topDistance=${topDistance.toFixed(3)}, threshold=${effectiveThreshold}, keywordOverlap=${hasKeywordOverlap}, inject=${shouldInject}, compositeScore=${results.exchanges[0].compositeScore?.toFixed(3) || 'n/a'}`);
 
                                 if (shouldInject) {
                                     // Flat context framing — no source hierarchy.
@@ -543,7 +717,8 @@ module.exports = {
                                     // just present as context. The agent shouldn't distinguish
                                     // between channels, sessions, or archive sources.
                                     lines.push('');
-                                    lines.push('You were part of these exchanges — use them naturally, don\'t narrate that you\'re remembering:');
+                                    lines.push('You were part of these exchanges — use them naturally, don\'t narrate that you\'re remembering.');
+                                    lines.push('IMPORTANT: Only state facts that appear explicitly below. Do not infer, extrapolate, or fill gaps with plausible details. If you\'re about to state something specific (a name, number, title, organization) that isn\'t in these exchanges, stop — that\'s inference, not memory.');
                                     const recalled = results.exchanges.slice(0, 3);
                                     // Sort chronologically (oldest → newest) so corrections
                                     // appear AFTER originals — natural temporal progression.
@@ -562,7 +737,8 @@ module.exports = {
                                             lines.push(`  You: "${_truncate(cleanAgentText, 800)}"`);
                                         }
                                     }
-                                    lines.push('Pick up naturally — no "I remember" preamble.');
+                                    lines.push('Pick up naturally — no "I remember" preamble. Stay within what\'s stated. If you need details not present here, say you\'d need to check rather than filling in.');
+                                    _debugRetrieval(`INJECTED ${recalled.length} exchanges into context (top distance=${topDistance.toFixed(3)})`);
                                 }
                             }
                         }
@@ -837,7 +1013,7 @@ module.exports = {
                 // state.sessionId is set on session_start but lost on gateway restart
                 const sessionId = ctx.sessionId || state.sessionId || null;
                 api.logger.info(`[Continuity:${state.agentId}] Archiving ${toArchive.length} messages with sessionId: ${sessionId} (ctx: ${ctx.sessionId}, state: ${state.sessionId})`);
-                state.archiver.archive(toArchive, { sessionId });
+                state.archiver.archive(toArchive, { sessionId, threadId: state.currentThreadId });
             } catch (err) {
                 console.error(`[Continuity:${state.agentId}] Archive failed: ${err.message}`);
             }
@@ -853,7 +1029,7 @@ module.exports = {
                         const topicTags = state.topicTracker
                             ? state.topicTracker.getAllTopics().slice(0, 5).map(t => t.topic)
                             : [];
-                        await state.indexer.indexDay(today, conversation.messages, { topicTags });
+                        await state.indexer.indexDay(today, conversation.messages, { topicTags, threadId: state.currentThreadId });
                     }
                 }
             } catch (err) {
@@ -865,6 +1041,16 @@ module.exports = {
 
             // Clear retrieval cache — it's per-turn, no longer needed after archiving.
             state.lastRetrievalCache = null;
+
+            // ── Consolidation restart signal (infinite threads) ──
+            // If consolidation was triggered by compaction threshold, signal the GUI
+            // to restart the session within this thread.
+            if (state.consolidationPending) {
+                state.consolidationPending = false;
+                state.threadCompactionCount = 0;
+                api.logger.info(`[Continuity:${state.agentId}] Consolidation restart signaled for thread ${state.currentThreadId}`);
+                return { metadata: { consolidation_restart: true, thread_id: state.currentThreadId } };
+            }
 
             // Session state (topics, anchors) is delivered via prependContext each turn.
             // MEMORY.md is left for the agent to curate per AGENTS.md instructions.
@@ -929,8 +1115,9 @@ module.exports = {
         api.on('after_compaction', async (event, ctx) => {
             const state = getAgentState(ctx.agentId);
 
-            // Increment compaction counter
+            // Increment compaction counters
             state.compactionCount++;
+            state.threadCompactionCount++;
 
             // ── Session Handoff ──
             // agent_end now writes handoff every exchange, so this is a safety net.
@@ -938,6 +1125,19 @@ module.exports = {
             const handoffThreshold = (config.sessionHandoff || {}).compactionThreshold || 3;
             if (state.compactionCount >= handoffThreshold) {
                 _writeSessionHandoff(state, config, ctx, api);
+            }
+
+            // ── Thread Consolidation (infinite threads) ──
+            // After N compactions in a thread, the live context is degraded.
+            // Signal a session restart to rebuild from crystallized state.
+            const consolidationThreshold = (config.threadConsolidation || {}).compactionThreshold || 5;
+            if (state.threadCompactionCount >= consolidationThreshold && state.currentThreadId !== 'main') {
+                api.logger.info(
+                    `[Continuity:${state.agentId}] Thread consolidation triggered ` +
+                    `(${state.threadCompactionCount} compactions in thread ${state.currentThreadId})`
+                );
+                _writeSessionHandoff(state, config, ctx, api);
+                state.consolidationPending = true;
             }
 
             // ── Hierarchical Summaries (existing logic) ──
@@ -980,6 +1180,7 @@ module.exports = {
                     topics: extractive.topics,
                     anchors: extractive.anchors,
                     entropyAvg: entropyScore,
+                    threadId: state.currentThreadId,
                     metadata: {
                         strategy: 'extractive',
                         compactedCount,
@@ -995,7 +1196,8 @@ module.exports = {
                         compactedMessages,
                         anchorState,
                         topicState,
-                        entropyScore
+                        entropyScore,
+                        state.currentThreadId
                     );
                     api.logger.info(`[Continuity:${state.agentId}] Compaction summary stored + queued for LLM enrichment (entropy: ${entropyScore.toFixed(2)})`);
                 } else {
@@ -1248,6 +1450,18 @@ module.exports = {
                 });
             }
             respond(true, agents);
+        });
+
+        // ── Infinite Threads: Consolidation state gateway method ──
+        api.registerGatewayMethod('continuity.getConsolidationState', async ({ params, respond }) => {
+            const agentId = params?.agentId || currentAgentId;
+            const state = agentStates.get(agentId);
+            respond({
+                consolidationPending: state?.consolidationPending || false,
+                threadId: state?.currentThreadId || 'main',
+                compactionCount: state?.threadCompactionCount || 0,
+                threshold: (config.threadConsolidation || {}).compactionThreshold || 5
+            });
         });
 
         // -------------------------------------------------------------------
@@ -1529,6 +1743,14 @@ const CONTEXT_BLOCK_HEADERS = [
     '[LOOP DETECTED]',
     '[PROJECT CONTEXT',        // injected workspace/project files (may have suffix like ": robot")
     '[NIGHTSHIFT REPORT',      // overnight processing report
+    '[THREAD:',                // infinite threads: thread_id marker in user messages
+    '[THREAD CONTEXT',         // infinite threads: per-thread persistent state
+    '[Chat messages since',    // multi-message catch-up context from gateway
+    '[CURRENT STATE',          // truth plugin: fact corrections that supersede older memories
+    '[/THREAD CONTEXT]',
+    '[CONSOLIDATION NOTICE]',  // infinite threads: compaction threshold signal
+    '[/CONSOLIDATION NOTICE]',
+    '[WARM START]',            // infinite threads: LLM-generated warm start
 ];
 
 /**
@@ -1606,6 +1828,9 @@ function _isContextLine(line) {
 
 function _stripContextBlocks(text) {
     if (!text) return '';
+
+    // Strip inline thread markers: [THREAD:session_1234567890]
+    text = text.replace(/\[THREAD:[^\]]*\]\s*/g, '');
 
     // Fast path: no context blocks or channel metadata present
     const hasBlock = CONTEXT_BLOCK_HEADERS.some(h => text.includes(h));
@@ -1786,7 +2011,12 @@ function _writeSessionHandoff(state, config, ctx, api) {
             process.env.OPENCLAW_WORKSPACE ||
             path.join(require('os').homedir(), '.openclaw', 'workspace-clint');
 
-        const handoffPath = path.join(workspacePath, 'SESSION_HANDOFF.md');
+        // Thread-scoped handoff: per-thread persistent state file
+        const threadId = state.currentThreadId || 'main';
+        const handoffFilename = threadId !== 'main'
+            ? `SESSION_HANDOFF_${threadId}.md`
+            : 'SESSION_HANDOFF.md';
+        const handoffPath = path.join(workspacePath, handoffFilename);
 
         // If the agent wrote one manually, respect it (within 5 minutes = agent-curated)
         if (fs.existsSync(handoffPath)) {
@@ -1838,10 +2068,15 @@ function _writeSessionHandoff(state, config, ctx, api) {
         // Build a lean summary from Topics, Anchors, and last 2 exchanges only.
         // Full archive is available via continuity retrieval — this is a bridge, not a copy.
         
+        // Determine current mode for handoff header
+        const currentMode = state._lastEventMetadata?.codeMode ? 'code'
+            : state._lastEventMetadata?.boothMode ? 'booth'
+            : 'chat';
+
         const lines = [
             `# Session Handoff`,
             '',
-            `*Auto-generated. Archive on startup. ${new Date().toISOString()}*`,
+            `*Thread: ${threadId} | Mode: ${currentMode} | Compactions: ${state.threadCompactionCount} | Last Active: ${new Date().toISOString()}*`,
             '',
             `## What Happened`,
             '',
@@ -1896,6 +2131,48 @@ function _writeSessionHandoff(state, config, ctx, api) {
             lines.push('');
         }
 
+        // Open Threads — unresolved tensions and work-in-progress
+        // Extract from anchors (tensions, contradictions) and topics with recurrence
+        const openThreads = [];
+        
+        // Tension anchors = unresolved threads
+        if (state.anchors) {
+            const anchorState = state.anchors.getAnchors();
+            const tensionAnchors = anchorState.filter(a => 
+                a.type === 'tension' || a.type === 'contradiction'
+            );
+            for (const a of tensionAnchors.slice(0, 3)) {
+                openThreads.push({
+                    source: 'tension',
+                    text: _truncate(a.text, 100),
+                    age: Math.round((Date.now() - a.timestamp) / 60000) + 'min ago'
+                });
+            }
+        }
+        
+        // Fixated topics = recurring discussions not yet resolved
+        if (state.topicTracker) {
+            const fixated = state.topicTracker.getFixatedTopics();
+            for (const t of fixated.slice(0, 2)) {
+                openThreads.push({
+                    source: 'topic',
+                    text: t.topic,
+                    age: t.mentions + ' mentions'
+                });
+            }
+        }
+        
+        if (openThreads.length > 0) {
+            lines.push('## Open Threads');
+            lines.push('');
+            lines.push('Unresolved threads from this session — pick up where you left off:');
+            lines.push('');
+            for (const thread of openThreads) {
+                lines.push(`- [${thread.source}] ${thread.text} (${thread.age})`);
+            }
+            lines.push('');
+        }
+
         // Guide Notes
         const postureGap = api.stability?.getPostureGap?.(state.agentId) || 0;
         const sustainedMinutes = state._sustainedWorkStart
@@ -1915,9 +2192,132 @@ function _writeSessionHandoff(state, config, ctx, api) {
         lines.push('*The next session starts fresh. Read this, then move to archive.*');
 
         fs.writeFileSync(handoffPath, lines.join('\n'), 'utf8');
-        api.logger.info(`[Continuity:${state.agentId}] Lean handoff written: ${exchangeCount} exchanges, ${lines.length} lines`);
+        api.logger.info(`[Continuity:${state.agentId}] Lean handoff written: ${exchangeCount} exchanges, ${lines.length} lines (thread: ${threadId})`);
     } catch (err) {
         api.logger.error(`[Continuity:${state.agentId}] Failed to write session handoff: ${err.message}`);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Infinite Threads: Helper functions
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Read persisted thread state from a handoff file header.
+ * Survives gateway restarts — the handoff file is the source of truth
+ * for thread compaction count and last active timestamp.
+ */
+function _readThreadStateFromHandoff(threadId, workspacePath) {
+    const handoffPath = path.join(workspacePath, `SESSION_HANDOFF_${threadId}.md`);
+    if (!fs.existsSync(handoffPath)) return null;
+
+    try {
+        const content = fs.readFileSync(handoffPath, 'utf8');
+        const headerMatch = content.match(
+            /Compactions:\s*(\d+)\s*\|\s*Last Active:\s*([^\s*]+)/
+        );
+        if (!headerMatch) return null;
+
+        return {
+            compactionCount: parseInt(headerMatch[1], 10) || 0,
+            lastActive: headerMatch[2]
+        };
+    } catch (err) {
+        return null;
+    }
+}
+
+/**
+ * Parse SESSION_HANDOFF markdown into structured sections.
+ * Used by the warm start generator to synthesize a natural summary.
+ */
+function _parseHandoffSections(handoffMd) {
+    const sections = {};
+
+    const topicsMatch = handoffMd.match(/## Topics\n([\s\S]*?)(?=\n##|\n---|\n$)/);
+    if (topicsMatch) {
+        sections.topics = topicsMatch[1].trim().split('\n')
+            .map(l => l.replace(/^-\s*/, '').replace(/\s*\(\d+x\)$/, '').trim())
+            .filter(Boolean);
+    }
+
+    const openMatch = handoffMd.match(/## Open Threads\n[\s\S]*?\n([\s\S]*?)(?=\n##|\n---|\n$)/);
+    if (openMatch) {
+        sections.openThreads = openMatch[1].trim().split('\n')
+            .map(l => ({ text: l.replace(/^-\s*\[.*?\]\s*/, '').trim() }))
+            .filter(t => t.text);
+    }
+
+    const keyMatch = handoffMd.match(/## Key Points\n([\s\S]*?)(?=\n##|\n---|\n$)/);
+    if (keyMatch) {
+        sections.keyPoints = keyMatch[1].trim().split('\n')
+            .map(l => l.replace(/^-\s*/, '').trim())
+            .filter(Boolean);
+    }
+
+    const exchMatch = handoffMd.match(/## Last Exchanges\n([\s\S]*?)(?=\n##|\n---|\n$)/);
+    if (exchMatch) {
+        sections.lastExchanges = exchMatch[1].trim().split('\n')
+            .map(l => l.replace(/^-\s*/, '').trim())
+            .filter(Boolean);
+    }
+
+    return sections;
+}
+
+/**
+ * Generate an LLM-powered warm-start summary from crystallized thread state.
+ * Reads ~500-800 tokens of handoff, produces ~200 tokens of natural prose.
+ * Graceful fallback: returns null if LLM unavailable or generation fails.
+ */
+async function _generateWarmStart(threadHandoff, threadId, state, config, api) {
+    if (!api.llm?.generate) return null;
+
+    const warmStartConfig = config.warmStart || {};
+    if (warmStartConfig.enabled === false) return null;
+
+    const sections = _parseHandoffSections(threadHandoff);
+    if (!sections.topics?.length && !sections.openThreads?.length) return null;
+
+    // Determine last mode from handoff header
+    const modeMatch = threadHandoff.match(/Mode:\s*(\w+)/);
+    const lastMode = modeMatch ? modeMatch[1] : 'chat';
+
+    const prompt = [
+        `You are resuming work in the "${threadId}" project thread.`,
+        lastMode !== 'chat' ? `Last session was in ${lastMode} mode.` : '',
+        `Generate a 1-2 paragraph warm-start summary that:`,
+        `- Reminds you where you left off (what was being worked on)`,
+        `- Surfaces open items and unresolved threads`,
+        `- Notes the mode context if relevant (e.g., "we were building X in Code mode")`,
+        `- Sounds like a trusted collaborator picking up mid-thought`,
+        `- Uses natural language, not bullet points`,
+        ``,
+        `Thread state:`,
+        sections.topics?.length ? `Topics: ${sections.topics.join(', ')}` : '',
+        sections.openThreads?.length
+            ? `Open items: ${sections.openThreads.map(t => t.text).join('; ')}`
+            : '',
+        sections.keyPoints?.length
+            ? `Key context: ${sections.keyPoints.slice(0, 3).join('; ')}`
+            : '',
+        sections.lastExchanges?.length
+            ? `Last exchange: ${sections.lastExchanges.slice(-2).join(' → ')}`
+            : '',
+    ].filter(Boolean).join('\n');
+
+    try {
+        const result = await api.llm.generate(prompt, {
+            temperature: 0.7,
+            maxTokens: 250,
+            timeout: warmStartConfig.timeoutMs || 8000
+        });
+        return result?.text || null;
+    } catch (err) {
+        if (api.logger) {
+            api.logger.warn(`[Continuity:${state.agentId}] Warm start generation failed: ${err.message}`);
+        }
+        return null;
     }
 }
 

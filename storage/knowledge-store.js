@@ -60,6 +60,13 @@ class KnowledgeStore {
         this.db.exec(`CREATE INDEX IF NOT EXISTS idx_knowledge_topic ON knowledge_entries(agent_id, topic)`);
         this.db.exec(`CREATE INDEX IF NOT EXISTS idx_knowledge_source ON knowledge_entries(source_hash)`);
 
+        // Add thread_id column for infinite thread scoping (future use)
+        try {
+            this.db.exec(`ALTER TABLE knowledge_entries ADD COLUMN thread_id TEXT DEFAULT NULL`);
+        } catch (e) {
+            if (!e.message.includes('duplicate column')) throw e;
+        }
+
         // Vector table for semantic search
         try {
             this.db.exec(`

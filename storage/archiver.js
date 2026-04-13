@@ -49,7 +49,8 @@ class Archiver {
                 timestamp: this._normalizeTimestamp(m.timestamp),
                 sender: m.role === 'user' ? 'user' : 'agent',
                 text: this._extractText(m),
-                sessionId: opts.sessionId || null
+                sessionId: opts.sessionId || null,
+                threadId: opts.threadId || null
             }));
 
         // Group by date

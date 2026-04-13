@@ -109,7 +109,7 @@ class Searcher {
      * @param {string[]} [scope.topics] - topic tags to filter by (OR logic)
      * @returns {{ exchanges: Array, distances: number[] }}
      */
-    async search(query, limit = 5, agentId, scope = null) {
+    async search(query, limit = 5, agentId, scope = null, threadId = null) {
         if (!this.db) {
             return { exchanges: [], distances: [], error: 'Database not available' };
         }
@@ -220,6 +220,15 @@ class Searcher {
                     const hasOverlap = tags.some(t => scopeTopics.has(t));
                     if (hasOverlap) {
                         compositeScore *= 1.5; // 50% boost for scope match
+                    }
+                }
+
+                // Thread-scope boost: in-thread results rank higher.
+                // Cross-thread results still surface if their base score is strong enough.
+                if (threadId && threadId !== 'main') {
+                    const exThreadId = ex.thread_id || null;
+                    if (exThreadId === threadId) {
+                        compositeScore *= 1.8; // 80% boost for same-thread
                     }
                 }
 
@@ -445,6 +454,7 @@ class Searcher {
                 e.exchange_index,
                 e.metadata,
                 e.topic_tags,
+                e.thread_id,
                 e.created_at,
                 v.distance
             FROM vec_exchanges v
@@ -463,6 +473,7 @@ class Searcher {
             combined: r.combined,
             metadata: this._parseMetadata(r.metadata),
             topicTags: r.topic_tags || '',
+            thread_id: r.thread_id || null,
             createdAt: r.created_at,
             distance: r.distance
         }));
@@ -497,6 +508,7 @@ class Searcher {
                     e.exchange_index,
                     e.metadata,
                     e.topic_tags,
+                    e.thread_id,
                     e.created_at,
                     bm25(fts_exchanges) AS bm25_score
                 FROM fts_exchanges f
@@ -515,6 +527,7 @@ class Searcher {
                 combined: r.combined,
                 metadata: this._parseMetadata(r.metadata),
                 topicTags: r.topic_tags || '',
+                thread_id: r.thread_id || null,
                 createdAt: r.created_at,
                 distance: null, // no vector distance for keyword results
                 bm25Score: r.bm25_score

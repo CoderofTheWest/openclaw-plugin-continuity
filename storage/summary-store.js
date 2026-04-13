@@ -92,6 +92,20 @@ class SummaryStore {
 
         this.db.exec(`CREATE INDEX IF NOT EXISTS idx_queue_status ON summary_queue(status)`);
 
+        // Add thread_id columns for infinite thread scoping
+        try {
+            this.db.exec(`ALTER TABLE summaries ADD COLUMN thread_id TEXT DEFAULT NULL`);
+        } catch (e) {
+            if (!e.message.includes('duplicate column')) throw e;
+        }
+        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_summaries_thread ON summaries(thread_id)`);
+
+        try {
+            this.db.exec(`ALTER TABLE summary_queue ADD COLUMN thread_id TEXT DEFAULT NULL`);
+        } catch (e) {
+            if (!e.message.includes('duplicate column')) throw e;
+        }
+
         // Topic hierarchy persistence
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS topic_hierarchy (
@@ -119,11 +133,11 @@ class SummaryStore {
     /**
      * Enqueue messages for async LLM summarization.
      */
-    enqueue(agentId, messages, anchorState, topicState, entropyScore) {
+    enqueue(agentId, messages, anchorState, topicState, entropyScore, threadId = null) {
         if (!this.db) return;
         const stmt = this.db.prepare(`
-            INSERT INTO summary_queue (agent_id, compaction_date, messages_json, anchor_state, topic_state, entropy_score)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO summary_queue (agent_id, compaction_date, messages_json, anchor_state, topic_state, entropy_score, thread_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         `);
         stmt.run(
             agentId,
@@ -131,7 +145,8 @@ class SummaryStore {
             JSON.stringify(messages),
             JSON.stringify(anchorState || []),
             JSON.stringify(topicState || []),
-            entropyScore || 0
+            entropyScore || 0,
+            threadId
         );
     }
 
@@ -184,8 +199,8 @@ class SummaryStore {
         const stmt = this.db.prepare(`
             INSERT OR REPLACE INTO summaries
             (id, level, parent_id, agent_id, date_range_start, date_range_end,
-             message_count, summary_text, topics, anchors, entropy_avg, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             message_count, summary_text, topics, anchors, entropy_avg, metadata, thread_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
 
         stmt.run(
@@ -200,7 +215,8 @@ class SummaryStore {
             JSON.stringify(summary.topics || []),
             JSON.stringify(summary.anchors || []),
             summary.entropyAvg || 0,
-            JSON.stringify(summary.metadata || {})
+            JSON.stringify(summary.metadata || {}),
+            summary.threadId || null
         );
 
         // Embed the summary for semantic search
