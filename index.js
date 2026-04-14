@@ -1743,7 +1743,9 @@ const CONTEXT_BLOCK_HEADERS = [
     '[LOOP DETECTED]',
     '[PROJECT CONTEXT',        // injected workspace/project files (may have suffix like ": robot")
     '[NIGHTSHIFT REPORT',      // overnight processing report
-    '[THREAD:',                // infinite threads: thread_id marker in user messages
+    // NOTE: [THREAD:] is NOT listed here — it's an inline marker stripped by regex
+    // in _stripContextBlocks, not a full-line context block header. Listing it here
+    // would cause the entire user message to be treated as a context block.
     '[THREAD CONTEXT',         // infinite threads: per-thread persistent state
     '[Chat messages since',    // multi-message catch-up context from gateway
     '[CURRENT STATE',          // truth plugin: fact corrections that supersede older memories
